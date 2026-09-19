@@ -191,10 +191,42 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
     private static var fetchInFlight = false
     private static var lastStatus: (date: Date, status: NetworkStatus)?
 
+    /// Mirrors the `easytier-cli node info` JSON (api_instance.proto NodeInfo).
+    private struct CliNodeInfo: Codable {
+        struct CliIpList: Codable {
+            var publicIPv4: NetworkStatus.IPv4Addr?
+            var interfaceIPv4s: [NetworkStatus.IPv4Addr]?
+            var publicIPv6: NetworkStatus.IPv6Addr?
+            var interfaceIPv6s: [NetworkStatus.IPv6Addr]?
+
+            enum CodingKeys: String, CodingKey {
+                case publicIPv4 = "public_ipv4"
+                case interfaceIPv4s = "interface_ipv4s"
+                case publicIPv6 = "public_ipv6"
+                case interfaceIPv6s = "interface_ipv6s"
+            }
+        }
+
+        var peerId: Int?
+        var ipv4Addr: String?
+        var hostname: String?
+        var version: String?
+        var stunInfo: NetworkStatus.STUNInfo?
+        var ipList: CliIpList?
+        var listeners: [NetworkStatus.Url]?
+
+        enum CodingKeys: String, CodingKey {
+            case peerId = "peer_id"
+            case ipv4Addr = "ipv4_addr"
+            case hostname, version
+            case stunInfo = "stun_info"
+            case ipList = "ip_list"
+            case listeners
+        }
+    }
+
     /// Queries the core's local RPC portal through `easytier-cli` and maps the
     /// result into the same NetworkStatus the NetworkExtension path provides.
-    /// NAT type, interface IP lists and the event timeline are not available
-    /// through this channel and stay empty.
     func fetchRunningInfo() async -> NetworkStatus {
         Self.fetchLock.lock()
         if Self.fetchInFlight, let cached = Self.lastStatus?.status {
@@ -215,14 +247,22 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
 
         let running = isCoreRunning()
         guard running, let cli = cliBinaryURL else {
-            return Self.cacheAndReturn(Self.assemble(pairs: [], running: false))
+            return Self.cacheAndReturn(Self.assemble(node: nil, pairs: [], running: false))
         }
-        let output = try? await runProcess(cli.path, ["--verbose", "peer"])
+
+        async let pairsOutput = runProcess(cli.path, ["--verbose", "peer"])
+        async let nodeOutput = runProcess(cli.path, ["node", "info"])
+        let (pairsJSON, nodeJSON) = try? await (pairsOutput, nodeOutput)
+
         var pairs: [NetworkStatus.PeerRoutePair] = []
-        if let output, let data = output.data(using: .utf8) {
+        if let pairsJSON, let data = pairsJSON.data(using: .utf8) {
             pairs = (try? JSONDecoder().decode([NetworkStatus.PeerRoutePair].self, from: data)) ?? []
         }
-        return Self.cacheAndReturn(Self.assemble(pairs: pairs, running: running))
+        var node: CliNodeInfo?
+        if let nodeJSON, let data = nodeJSON.data(using: .utf8) {
+            node = try? JSONDecoder().decode(CliNodeInfo.self, from: data)
+        }
+        return Self.cacheAndReturn(Self.assemble(node: node, pairs: pairs, running: running))
     }
 
     private static func cacheAndReturn(_ status: NetworkStatus) -> NetworkStatus {
@@ -230,22 +270,38 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
         return status
     }
 
+    private static func parseIPv4CIDR(_ string: String?) -> NetworkStatus.IPv4CIDR? {
+        guard let string, !string.isEmpty else { return nil }
+        let parts = string.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let address = NetworkStatus.IPv4Addr(String(parts[0])) else { return nil }
+        let prefix = parts.count > 1 ? Int(parts[1]) ?? 32 : 32
+        return NetworkStatus.IPv4CIDR(address: address, networkLength: prefix)
+    }
+
     private static func assemble(
+        node: CliNodeInfo?,
         pairs: [NetworkStatus.PeerRoutePair],
         running: Bool
     ) -> NetworkStatus {
-        // The local peer has cost 0 and no PeerInfo entry attached.
-        let local = pairs.first { $0.peer == nil && $0.route.cost == 0 }
-        let myNodeInfo = local.map {
-            NetworkStatus.MyNodeInfo(
-                virtualIPv4: $0.route.ipv4Addr,
-                hostname: $0.route.hostname,
-                version: $0.route.version,
-                ips: nil,
-                stunInfo: nil,
-                listeners: nil,
+        var myNodeInfo: NetworkStatus.MyNodeInfo?
+        if let node {
+            let ips = node.ipList.map {
+                NetworkStatus.MyNodeInfo.IPList(
+                    publicIPv4: $0.publicIPv4,
+                    interfaceIPv4s: $0.interfaceIPv4s,
+                    publicIPv6: $0.publicIPv6,
+                    interfaceIPv6s: $0.interfaceIPv6s
+                )
+            }
+            myNodeInfo = NetworkStatus.MyNodeInfo(
+                virtualIPv4: parseIPv4CIDR(node.ipv4Addr),
+                hostname: node.hostname ?? "",
+                version: node.version ?? "",
+                ips: ips,
+                stunInfo: node.stunInfo,
+                listeners: node.listeners,
                 vpnPortalCfg: nil,
-                peerID: $0.route.peerId
+                peerID: node.peerId
             )
         }
         return NetworkStatus(
