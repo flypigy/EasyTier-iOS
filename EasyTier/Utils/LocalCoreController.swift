@@ -21,13 +21,13 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
     private static let daemonPlistPath = "/Library/LaunchDaemons/cn.easytier.core.plist"
     private static let watchScriptName = "core-watch.sh"
     private static let binaryName = "easytier-core"
-    private static let maxLogBytes = 10 * 1024 * 1024
     private static let startTimeoutSeconds = 30.0
 
     enum LocalCoreError: LocalizedError {
         case coreBinaryMissing
         case optionsMissing
         case configEmpty
+        case configWriteFailed(path: String, underlying: String)
         case startTimeout(String?)
         case logUnavailable
         case installCancelled
@@ -42,6 +42,8 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
                 return "no tunnel options saved, save a profile before connecting"
             case .configEmpty:
                 return "tunnel options contain an empty core config"
+            case .configWriteFailed(let path, let underlying):
+                return "failed to write \(path): \(underlying)"
             case .startTimeout(let log):
                 return "easytier-core did not start within timeout\(log.map { ": \($0)" } ?? "")"
             case .logUnavailable:
@@ -79,22 +81,44 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
     }
 
     init() {
+        // The app group container may be unusable for ad-hoc signed apps, so
+        // probe it and fall back to Application Support before giving up.
         let container = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: APP_GROUP_ID
         )
-        let base = container
-            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-        let dir = base?.appendingPathComponent("LocalCore", isDirectory: true)
-        if let dir {
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            stateDir = dir
+        let containerUsable = container != nil
+            && Self.ensureWritableDir(container!.appendingPathComponent("LocalCore", isDirectory: true))
+        if containerUsable, let container {
+            stateDir = container.appendingPathComponent("LocalCore", isDirectory: true)
+            logURL = container.appendingPathComponent(LOG_FILENAME)
         } else {
-            stateDir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("EasyTierLocalCore", isDirectory: true)
-            try? FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
+            let fallback = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+                .first?
+                .appendingPathComponent("EasyTier", isDirectory: true)
+                .appendingPathComponent("LocalCore", isDirectory: true)
+                ?? FileManager.default.temporaryDirectory
+                    .appendingPathComponent("EasyTierLocalCore", isDirectory: true)
+            Self.ensureWritableDir(fallback)
+            stateDir = fallback
+            logURL = fallback.deletingLastPathComponent().appendingPathComponent(LOG_FILENAME)
         }
-        logURL = base?.appendingPathComponent(LOG_FILENAME)
-            ?? stateDir.appendingPathComponent(LOG_FILENAME)
+    }
+
+    /// Creates the directory and verifies it is actually writable with a probe file.
+    @discardableResult
+    private static func ensureWritableDir(_ dir: URL) -> Bool {
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let probe = dir.appendingPathComponent(".probe-\(UUID().uuidString)")
+            try Data("ok".utf8).write(to: probe)
+            try? FileManager.default.removeItem(at: probe)
+            return true
+        } catch {
+            logger.error(
+                "directory \(dir.path, privacy: .public) is not usable: \(String(describing: error), privacy: .public)"
+            )
+            return false
+        }
     }
 
     // MARK: - Connection
@@ -106,7 +130,23 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
             throw LocalCoreError.configEmpty
         }
         Self.logger.info("connect(): writing core config")
-        try config.write(to: configURL, atomically: true, encoding: .utf8)
+        do {
+            guard Self.ensureWritableDir(stateDir) else {
+                throw LocalCoreError.configWriteFailed(
+                    path: stateDir.path,
+                    underlying: "cannot create a writable state directory"
+                )
+            }
+            try? FileManager.default.removeItem(at: configURL)
+            try config.write(to: configURL, atomically: true, encoding: .utf8)
+        } catch let error as LocalCoreError {
+            throw error
+        } catch {
+            throw LocalCoreError.configWriteFailed(
+                path: configURL.path,
+                underlying: error.localizedDescription
+            )
+        }
 
         let deadline = Date().addingTimeInterval(Self.startTimeoutSeconds)
         while Date() < deadline {
@@ -202,10 +242,14 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
         if installed {
             let sameBinary = (try? Self.sha256(of: installedBinaryURL))
                 == (try? Self.sha256(of: bundled))
-            if sameBinary {
+            let scriptMatches = (try? String(
+                contentsOf: URL(fileURLWithPath: "\(Self.installDir)/\(Self.watchScriptName)"),
+                encoding: .utf8
+            )) == Self.renderedWatchScript()
+            if sameBinary && scriptMatches {
                 return
             }
-            Self.logger.info("bundled core binary changed, reinstalling service")
+            Self.logger.info("installed service is outdated (binary or paths changed), reinstalling")
         }
         try await installService(bundledBinary: bundled)
     }
@@ -217,11 +261,7 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
         defer { try? FileManager.default.removeItem(at: staging) }
 
         let scriptURL = staging.appendingPathComponent(Self.watchScriptName)
-        try Self.watchScript
-            .replacingOccurrences(of: "__CONFIG_FILE__", with: configURL.path)
-            .replacingOccurrences(of: "__LOG_FILE__", with: logURL.path)
-            .replacingOccurrences(of: "__STATE_FILE__", with: stateURL.path)
-            .write(to: scriptURL, atomically: true, encoding: .utf8)
+        try Self.renderedWatchScript().write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o755], ofItemAtPath: scriptURL.path
         )
@@ -314,6 +354,13 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
 
     // MARK: - Installed payloads
 
+    private static func renderedWatchScript() -> String {
+        watchScript
+            .replacingOccurrences(of: "__CONFIG_FILE__", with: Self.shared.configURL.path)
+            .replacingOccurrences(of: "__LOG_FILE__", with: Self.shared.logURL.path)
+            .replacingOccurrences(of: "__STATE_FILE__", with: Self.shared.stateURL.path)
+    }
+
     /// Supervises easytier-core: runs it while `config.toml` exists, restarts
     /// it when the file changes, and stops it when the file disappears.
     private static let watchScript = #"""
@@ -335,6 +382,7 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
     write_state false null null null
     while true; do
       if [ -s "${CONFIG}" ]; then
+        mkdir -p "$(dirname "${LOG}")" "$(dirname "${STATE}")" 2>/dev/null
         MTIME=$(stat -f %m "${CONFIG}" 2>/dev/null || echo 0)
         if [ -f "${LOG}" ] && [ "$(stat -f %z "${LOG}" 2>/dev/null || echo 0)" -gt 10485760 ]; then
           : > "${LOG}"
