@@ -3,3 +3,6 @@ build.log
 compile_commands.json
 
 CLAUDE.md
+
+# Downloaded at CI build time, bundled as an app resource
+EasyTier/easytier-core

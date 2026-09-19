@@ -65,11 +65,17 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
     private var connection: NEVPNConnection?
     private var observer: Any?
 
+#if os(macOS)
+    // On macOS the tunnel runs via a privileged local core service instead of
+    // the NetworkExtension provider, so no NE entitlements are required.
+    private var localStatusTask: Task<Void, Never>?
+#endif
+
     @Published var status: NEVPNStatus
     @Published var connectedDate: Date?
     @Published var isLoading = true
     @Published var isAlwaysOnEnabled = false
-    
+
     init() {
         status = .invalid
     }
@@ -153,6 +159,11 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
 
     func load() async throws {
         Self.logger.info("load()")
+#if os(macOS)
+        isLoading = false
+        refreshLocalCoreStatus()
+        startLocalCoreStatusPolling()
+#else
         do {
             let managers = try await NETunnelProviderManager.loadAllFromPreferences()
             let manager = managers.first
@@ -169,7 +180,64 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
             reset()
             throw error
         }
+#endif
     }
+
+#if os(macOS)
+    private func startLocalCoreStatusPolling() {
+        guard localStatusTask == nil else { return }
+        localStatusTask = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.pollLocalCoreStatus()
+                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    private func refreshLocalCoreStatus() {
+        let controller = LocalCoreController.shared
+        let state = controller.currentState()
+        if controller.isCoreRunning(state: state) {
+            if status != .connected {
+                status = .connected
+                syncWidgetState()
+            }
+            connectedDate = state?.startedAt.map { Date(timeIntervalSince1970: $0) }
+        } else if status == .connecting {
+            // connect() owns the startup timeout, do not interfere
+        } else {
+            if status != .disconnected {
+                syncWidgetState()
+            }
+            status = .disconnected
+            connectedDate = nil
+        }
+    }
+
+    private func pollLocalCoreStatus() {
+        let controller = LocalCoreController.shared
+        let state = controller.currentState()
+        let running = controller.isCoreRunning(state: state)
+        if running {
+            if status != .connected {
+                status = .connected
+                syncWidgetState()
+            }
+            connectedDate = state?.startedAt.map { Date(timeIntervalSince1970: $0) }
+        } else if status == .connecting {
+            // connect() owns the startup timeout, do not interfere
+        } else {
+            if status == .connected || status == .connecting,
+               let exitCode = state?.exitCode, exitCode != 0 {
+                let message = controller.logTail() ?? "easytier-core exited with status \(exitCode)"
+                UserDefaults(suiteName: APP_GROUP_ID)?.set(message, forKey: "TunnelLastError")
+            }
+            status = .disconnected
+            connectedDate = nil
+            syncWidgetState()
+        }
+    }
+#endif
     
     static func generateOptions(_ profile: inout NetworkProfile) throws -> EasyTierOptions {
         try profile.prepareForUse()
@@ -238,6 +306,19 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
             Self.logger.warning("connect() failed: not loaded")
             return
         }
+#if os(macOS)
+        UserDefaults(suiteName: APP_GROUP_ID)?.removeObject(forKey: "TunnelLastError")
+        status = .connecting
+        do {
+            try await LocalCoreController.shared.connect()
+        } catch {
+            status = .disconnected
+            Self.logger.error("connect() local core failed: \(String(describing: error))")
+            throw error
+        }
+        Self.logger.info("connect() local core started")
+        syncWidgetState()
+#else
         if status == .invalid {
             _ = try await NetworkExtensionManager.install()
             try await load()
@@ -256,9 +337,20 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         Self.logger.info("connect() started")
         // Immediately sync widget state after initiating connection
         syncWidgetState()
+#endif
     }
-    
+
     func disconnect() async {
+#if os(macOS)
+        guard [.connecting, .connected, .reasserting].contains(status) else {
+            return
+        }
+        status = .disconnecting
+        await LocalCoreController.shared.disconnect()
+        status = .disconnected
+        connectedDate = nil
+        syncWidgetState()
+#else
         guard let manager else {
             Self.logger.error("disconnect() failed: manager is nil")
             return
@@ -275,6 +367,7 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         while [.connecting, .connected, .reasserting, .disconnecting].contains(connection.status) {
             try? await Task.sleep(for: .milliseconds(100))
         }
+#endif
     }
     
     func updateName(name: String, server: String) async {
@@ -368,6 +461,9 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
     }
 
     func exportExtensionLogs() async throws -> URL {
+#if os(macOS)
+        return try LocalCoreController.shared.exportLogURL()
+#else
         guard let manager,
               let session = manager.connection as? NETunnelProviderSession,
               session.status == .connected else {
@@ -398,9 +494,13 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
                 continuation.resume(throwing: error)
             }
         }
+#endif
     }
 
     func clearCoreLog() async throws {
+#if os(macOS)
+        try LocalCoreController.shared.clearLog()
+#else
         guard let manager,
               let session = manager.connection as? NETunnelProviderSession,
               session.status == .connected else {
@@ -431,10 +531,15 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
                 continuation.resume(throwing: error)
             }
         }
+#endif
     }
 
     @MainActor
     func setAlwaysOnEnabled(_ enabled: Bool) async throws {
+#if os(macOS)
+        // The local core service is supervised by launchd, nothing to persist.
+        isAlwaysOnEnabled = enabled
+#else
         if status == .invalid || manager == nil {
             _ = try await NetworkExtensionManager.install()
             try await load()
@@ -453,6 +558,7 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         manager.isOnDemandEnabled = enabled
         try await manager.saveToPreferences()
         isAlwaysOnEnabled = enabled
+#endif
     }
 }
 

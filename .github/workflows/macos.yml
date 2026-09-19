@@ -17,6 +17,7 @@ env:
   SCHEME: EasyTier
   BUILD_CONFIGURATION: Release
   APP_ZIP: EasyTier-macos-arm64.zip
+  EASYTIER_VERSION: v2.6.4
 
 jobs:
   build-macos-arm64:
@@ -53,6 +54,24 @@ jobs:
         with:
           workspaces: Core
 
+      - name: Download official easytier-core binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${EASYTIER_VERSION}"
+          ZIP_URL="https://github.com/EasyTier/EasyTier/releases/download/${VERSION}/easytier-macos-aarch64-${VERSION}.zip"
+          curl -sSfL "${ZIP_URL}" -o "${RUNNER_TEMP}/easytier-core.zip"
+          mkdir -p "${RUNNER_TEMP}/easytier-core-pkg"
+          unzip -o "${RUNNER_TEMP}/easytier-core.zip" -d "${RUNNER_TEMP}/easytier-core-pkg"
+
+          CORE_BINARY="$(find "${RUNNER_TEMP}/easytier-core-pkg" -type f -name easytier-core | head -n 1)"
+          test -n "${CORE_BINARY}" || { echo "easytier-core not found in release zip"; exit 1; }
+          cp -f "${CORE_BINARY}" "EasyTier/easytier-core"
+          chmod +x "EasyTier/easytier-core"
+          codesign --force --sign - --timestamp=none "EasyTier/easytier-core"
+          file "EasyTier/easytier-core"
+
       - name: Build Release app for macOS arm64
         shell: bash
         run: |
@@ -72,6 +91,9 @@ jobs:
             DEVELOPMENT_TEAM="" \
             CURRENT_PROJECT_VERSION="${GITHUB_RUN_NUMBER}"
 
+          test -f "${APP_PATH}/Contents/Resources/easytier-core" \
+            || { echo "easytier-core resource missing from app bundle"; ls -la "${APP_PATH}/Contents/Resources"; exit 1; }
+          file "${APP_PATH}/Contents/Resources/easytier-core"
           file "${APP_PATH}/Contents/MacOS/EasyTier"
 
       - name: Ad-hoc sign app for local use
@@ -158,9 +180,12 @@ jobs:
             echo "Automated Release build for macOS (Apple Silicon, arm64) from [\`${SHORT_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})."
             echo
             echo "- Build configuration: \`${BUILD_CONFIGURATION}\`, arch: \`arm64\`"
-            echo "- Code signing: ad-hoc (no Apple credentials needed). Remove the quarantine attribute before first launch:"
-            echo "  \`xattr -cr EasyTier.app\`"
-            echo "> The VPN tunnel requires the packet-tunnel-provider entitlement, which an ad-hoc signature cannot carry. Re-sign the app with your own Apple Developer identity to enable it."
+            echo "- Bundles the official \`easytier-core\` (${EASYTIER_VERSION}) for the local core mode: the tunnel runs as a root LaunchDaemon instead of NetworkExtension, so the VPN works without Apple Developer signing."
+            echo "- On first connect, macOS asks for the administrator password once to install the service; later connects/disconnects need no password."
+            echo "- Known limitations of local core mode: peer/route details are not shown and the widget always reports disconnected (they require NetworkExtension)."
+            echo "- Remove the quarantine attribute before first launch: \`xattr -cr EasyTier.app\`"
+            echo "- Uninstall the service with:"
+            echo "  \`sudo launchctl bootout system/cn.easytier.core; sudo rm -f /Library/LaunchDaemons/cn.easytier.core.plist; sudo rm -rf \"/Library/Application Support/EasyTier\"\`"
             echo "- Built: ${BUILD_TIME}"
             echo "- Workflow run: [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
           } > "${RELEASE_NOTES}"
