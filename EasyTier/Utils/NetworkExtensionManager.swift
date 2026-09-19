@@ -378,6 +378,12 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
     }
     
     func fetchRunningInfo(_ callback: @escaping ((NetworkStatus) -> Void)) {
+#if os(macOS)
+        Task {
+            let info = await LocalCoreController.shared.fetchRunningInfo()
+            callback(info)
+        }
+#else
         guard let manager else { return }
         guard let session = manager.connection as? NETunnelProviderSession,
               session.status != .invalid else { return }
@@ -400,6 +406,7 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
         } catch {
             Self.logger.error("fetchRunningInfo() failed: \(String(describing: error))")
         }
+#endif
     }
 
     func fetchLastNetworkSettings(_ callback: @escaping ((TunnelNetworkSettingsSnapshot?) -> Void)) {

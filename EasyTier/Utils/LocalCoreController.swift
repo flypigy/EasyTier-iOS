@@ -183,6 +183,83 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
         return isProcessAlive()
     }
 
+    private var cliBinaryURL: URL? {
+        Bundle.main.url(forResource: "easytier-cli", withExtension: nil)
+    }
+
+    private static let fetchLock = NSLock()
+    private static var fetchInFlight = false
+    private static var lastStatus: (date: Date, status: NetworkStatus)?
+
+    /// Queries the core's local RPC portal through `easytier-cli` and maps the
+    /// result into the same NetworkStatus the NetworkExtension path provides.
+    /// NAT type, interface IP lists and the event timeline are not available
+    /// through this channel and stay empty.
+    func fetchRunningInfo() async -> NetworkStatus {
+        Self.fetchLock.lock()
+        if Self.fetchInFlight, let cached = Self.lastStatus?.status {
+            Self.fetchLock.unlock()
+            return cached
+        }
+        if let last = Self.lastStatus, Date().timeIntervalSince(last.date) < 1.0 {
+            Self.fetchLock.unlock()
+            return last.status
+        }
+        Self.fetchInFlight = true
+        Self.fetchLock.unlock()
+        defer {
+            Self.fetchLock.lock()
+            Self.fetchInFlight = false
+            Self.fetchLock.unlock()
+        }
+
+        let running = isCoreRunning()
+        guard running, let cli = cliBinaryURL else {
+            return Self.cacheAndReturn(Self.assemble(pairs: [], running: false))
+        }
+        let output = try? await runProcess(cli.path, ["--verbose", "peer"])
+        var pairs: [NetworkStatus.PeerRoutePair] = []
+        if let output, let data = output.data(using: .utf8) {
+            pairs = (try? JSONDecoder().decode([NetworkStatus.PeerRoutePair].self, from: data)) ?? []
+        }
+        return Self.cacheAndReturn(Self.assemble(pairs: pairs, running: running))
+    }
+
+    private static func cacheAndReturn(_ status: NetworkStatus) -> NetworkStatus {
+        lastStatus = (Date(), status)
+        return status
+    }
+
+    private static func assemble(
+        pairs: [NetworkStatus.PeerRoutePair],
+        running: Bool
+    ) -> NetworkStatus {
+        // The local peer has cost 0 and no PeerInfo entry attached.
+        let local = pairs.first { $0.peer == nil && $0.route.cost == 0 }
+        let myNodeInfo = local.map {
+            NetworkStatus.MyNodeInfo(
+                virtualIPv4: $0.route.ipv4Addr,
+                hostname: $0.route.hostname,
+                version: $0.route.version,
+                ips: nil,
+                stunInfo: nil,
+                listeners: nil,
+                vpnPortalCfg: nil,
+                peerID: $0.route.peerId
+            )
+        }
+        return NetworkStatus(
+            devName: "utun",
+            myNodeInfo: myNodeInfo,
+            events: [],
+            routes: pairs.map(\.route),
+            peers: pairs.compactMap(\.peer),
+            peerRoutePairs: pairs,
+            running: running,
+            errorMsg: nil
+        )
+    }
+
     private func isProcessAlive() -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
@@ -390,7 +467,7 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
         chmod 666 "${LOG}" 2>/dev/null
         echo "=== $(date '+%Y-%m-%d %H:%M:%S') starting easytier-core ===" >> "${LOG}"
         STARTED=$(date +%s)
-        "${BIN}" --config-file "${CONFIG}" >> "${LOG}" 2>&1 &
+        "${BIN}" --rpc-portal "127.0.0.1:15888" --config-file "${CONFIG}" >> "${LOG}" 2>&1 &
         PID=$!
         write_state true "${PID}" "${STARTED}" null
         while kill -0 "${PID}" 2>/dev/null; do

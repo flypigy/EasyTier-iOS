@@ -1,7 +1,7 @@
 import Foundation
 import SwiftUI
 
-struct NetworkStatus: Codable {
+nonisolated struct NetworkStatus: Codable {
     enum NATType: Int, Codable {
         case unknown = 0
         case openInternet = 1

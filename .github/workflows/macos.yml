@@ -70,7 +70,14 @@ jobs:
           cp -f "${CORE_BINARY}" "EasyTier/easytier-core"
           chmod +x "EasyTier/easytier-core"
           codesign --force --sign - --timestamp=none "EasyTier/easytier-core"
-          file "EasyTier/easytier-core"
+
+          CLI_BINARY="$(find "${RUNNER_TEMP}/easytier-core-pkg" -type f -name easytier-cli | head -n 1)"
+          test -n "${CLI_BINARY}" || { echo "easytier-cli not found in release zip"; exit 1; }
+          cp -f "${CLI_BINARY}" "EasyTier/easytier-cli"
+          chmod +x "EasyTier/easytier-cli"
+          codesign --force --sign - --timestamp=none "EasyTier/easytier-cli"
+
+          file "EasyTier/easytier-core" "EasyTier/easytier-cli"
 
       - name: Build Release app for macOS arm64
         shell: bash
@@ -93,7 +100,9 @@ jobs:
 
           test -f "${APP_PATH}/Contents/Resources/easytier-core" \
             || { echo "easytier-core resource missing from app bundle"; ls -la "${APP_PATH}/Contents/Resources"; exit 1; }
-          file "${APP_PATH}/Contents/Resources/easytier-core"
+          test -f "${APP_PATH}/Contents/Resources/easytier-cli" \
+            || { echo "easytier-cli resource missing from app bundle"; ls -la "${APP_PATH}/Contents/Resources"; exit 1; }
+          file "${APP_PATH}/Contents/Resources/easytier-core" "${APP_PATH}/Contents/Resources/easytier-cli"
           file "${APP_PATH}/Contents/MacOS/EasyTier"
 
       - name: Ad-hoc sign app for local use
@@ -182,7 +191,7 @@ jobs:
             echo "- Build configuration: \`${BUILD_CONFIGURATION}\`, arch: \`arm64\`"
             echo "- Bundles the official \`easytier-core\` (${EASYTIER_VERSION}) for the local core mode: the tunnel runs as a root LaunchDaemon instead of NetworkExtension, so the VPN works without Apple Developer signing."
             echo "- On first connect, macOS asks for the administrator password once to install the service; later connects/disconnects need no password."
-            echo "- Known limitations of local core mode: peer/route details are not shown and the widget always reports disconnected (they require NetworkExtension)."
+            echo "- Local core mode fetches status via a loopback-only RPC portal (127.0.0.1:15888): virtual IP, version and the peer list work. NAT type, interface IP lists, the event timeline and the widget status are not available in this mode."
             echo "- Remove the quarantine attribute before first launch: \`xattr -cr EasyTier.app\`"
             echo "- Uninstall the service with:"
             echo "  \`sudo launchctl bootout system/cn.easytier.core; sudo rm -f /Library/LaunchDaemons/cn.easytier.core.plist; sudo rm -rf \"/Library/Application Support/EasyTier\"\`"
