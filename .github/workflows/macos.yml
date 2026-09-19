@@ -1,0 +1,192 @@
+name: macOS Build
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SCHEME: EasyTier
+  BUILD_CONFIGURATION: Release
+  APP_ZIP: EasyTier-macos-arm64.zip
+
+jobs:
+  build-macos-arm64:
+    name: Build macOS arm64 app
+    runs-on: macos-26
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Select Xcode and install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "DERIVED_DATA_PATH=${RUNNER_TEMP}/derived" >> "${GITHUB_ENV}"
+          echo "APP_PATH=${RUNNER_TEMP}/derived/Build/Products/Release/EasyTier.app" >> "${GITHUB_ENV}"
+          echo "EXPORT_PATH=${RUNNER_TEMP}/export" >> "${GITHUB_ENV}"
+
+          sudo xcode-select --switch /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+
+          rustup target add aarch64-apple-darwin
+          if ! command -v protoc >/dev/null 2>&1; then
+            brew install protobuf
+          fi
+
+          rustc --version
+          protoc --version
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Core
+
+      - name: Build Release app for macOS arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcodebuild build \
+            -project EasyTier.xcodeproj \
+            -scheme "${SCHEME}" \
+            -configuration "${BUILD_CONFIGURATION}" \
+            -destination "generic/platform=macOS" \
+            -derivedDataPath "${DERIVED_DATA_PATH}" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            CURRENT_PROJECT_VERSION="${GITHUB_RUN_NUMBER}"
+
+          file "${APP_PATH}/Contents/MacOS/EasyTier"
+
+      - name: Ad-hoc sign app for local use
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TUNNEL_PATH="${APP_PATH}/Contents/PlugIns/EasyTierNetworkExtension.appex"
+          WIDGET_PATH="${APP_PATH}/Contents/PlugIns/EasyTierWidgetExtension.appex"
+          ENTITLEMENTS="${RUNNER_TEMP}/EasyTier.macos.entitlements"
+
+          # Ad-hoc signatures cannot carry provisioning-restricted entitlements
+          # (com.apple.developer.*); keep only the app group so the app still
+          # launches on Apple Silicon. Re-sign with a real identity to enable
+          # the packet tunnel provider.
+          cat > "${ENTITLEMENTS}" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.application-groups</key>
+            <array>
+              <string>group.cn.easytier</string>
+            </array>
+          </dict>
+          </plist>
+          EOF
+
+          codesign \
+            --force \
+            --sign - \
+            --timestamp=none \
+            --generate-entitlement-der \
+            --entitlements "${ENTITLEMENTS}" \
+            "${WIDGET_PATH}"
+          codesign \
+            --force \
+            --sign - \
+            --timestamp=none \
+            --generate-entitlement-der \
+            --entitlements "${ENTITLEMENTS}" \
+            "${TUNNEL_PATH}"
+          codesign \
+            --force \
+            --sign - \
+            --timestamp=none \
+            --generate-entitlement-der \
+            --entitlements "${ENTITLEMENTS}" \
+            "${APP_PATH}"
+
+          codesign --verify --deep --strict "${APP_PATH}"
+          spctl -a -t exec "${APP_PATH}" || true
+
+      - name: Package app zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${EXPORT_PATH}"
+          ditto -c -k --keepParent "${APP_PATH}" "${EXPORT_PATH}/${APP_ZIP}"
+          shasum -a 256 "${EXPORT_PATH}/${APP_ZIP}" > "${EXPORT_PATH}/${APP_ZIP}.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: EasyTier-macos-arm64-${{ github.run_number }}
+          path: ${{ runner.temp }}/export/EasyTier-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Update rolling macOS release
+        if: github.repository_owner == 'flypigy'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_TIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          RELEASE_NOTES="${RUNNER_TEMP}/macos-release-notes.md"
+
+          {
+            echo "Automated Release build for macOS (Apple Silicon, arm64) from [\`${SHORT_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})."
+            echo
+            echo "- Build configuration: \`${BUILD_CONFIGURATION}\`, arch: \`arm64\`"
+            echo "- Code signing: ad-hoc (no Apple credentials needed). Remove the quarantine attribute before first launch:"
+            echo "  \`xattr -cr EasyTier.app\`"
+            echo "> The VPN tunnel requires the packet-tunnel-provider entitlement, which an ad-hoc signature cannot carry. Re-sign the app with your own Apple Developer identity to enable it."
+            echo "- Built: ${BUILD_TIME}"
+            echo "- Workflow run: [#${GITHUB_RUN_NUMBER}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
+          } > "${RELEASE_NOTES}"
+
+          git tag --force macos "${GITHUB_SHA}"
+          git push --force origin refs/tags/macos
+
+          if gh release view macos >/dev/null 2>&1; then
+            gh release edit macos \
+              --target "${GITHUB_SHA}" \
+              --title "EasyTier macOS (arm64, ${SHORT_SHA})" \
+              --notes-file "${RELEASE_NOTES}" \
+              --prerelease \
+              --latest=false
+            gh release upload macos \
+              "${EXPORT_PATH}/${APP_ZIP}" \
+              "${EXPORT_PATH}/${APP_ZIP}.sha256" \
+              --clobber
+          else
+            gh release create macos \
+              "${EXPORT_PATH}/${APP_ZIP}" \
+              "${EXPORT_PATH}/${APP_ZIP}.sha256" \
+              --verify-tag \
+              --target "${GITHUB_SHA}" \
+              --title "EasyTier macOS (arm64, ${SHORT_SHA})" \
+              --notes-file "${RELEASE_NOTES}" \
+              --prerelease \
+              --latest=false
+          fi
