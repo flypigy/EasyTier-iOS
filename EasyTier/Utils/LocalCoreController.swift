@@ -332,6 +332,31 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
         }
     }
 
+    // MARK: - Selected profile hint
+
+    /// Suite defaults ("group.*") may not persist reliably for ad-hoc signed
+    /// apps, so the last selected profile name is mirrored to a plain file and
+    /// restored from it when AppStorage comes back empty.
+    private var selectedProfileHintURL: URL {
+        stateDir.appendingPathComponent("selected-profile")
+    }
+
+    func storeSelectedProfileHint(_ name: String?) {
+        if let name {
+            try? name.write(to: selectedProfileHintURL, atomically: true, encoding: .utf8)
+        } else {
+            try? FileManager.default.removeItem(at: selectedProfileHintURL)
+        }
+    }
+
+    func loadSelectedProfileHint() -> String? {
+        guard let raw = try? String(contentsOf: selectedProfileHintURL, encoding: .utf8) else {
+            return nil
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     // MARK: - Log
 
     func logTail(maxLines: Int = 40) -> String? {

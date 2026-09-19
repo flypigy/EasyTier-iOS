@@ -548,8 +548,23 @@ struct DashboardView<Manager: NetworkExtensionManagerProtocol>: View {
                 ensureWebIdentity()
                 if let session = selectedSession.session {
                     currentProfile = session.document.profile
-                } else if let lastSelected {
-                    await loadProfile(lastSelected)
+                } else {
+#if os(macOS)
+                    // Suite defaults may not persist for ad-hoc signed builds;
+                    // fall back to the mirrored hint file.
+                    let restoreName = lastSelected ?? LocalCoreController.shared.loadSelectedProfileHint()
+#else
+                    let restoreName = lastSelected
+#endif
+                    if let restoreName {
+                        await loadProfile(restoreName)
+#if os(macOS)
+                        if selectedSession.session == nil {
+                            // The hinted profile is gone; stop restoring to it.
+                            LocalCoreController.shared.storeSelectedProfileHint(nil)
+                        }
+#endif
+                    }
                 }
             }
             // Register Darwin notification observer for tunnel errors
@@ -704,6 +719,9 @@ struct DashboardView<Manager: NetworkExtensionManagerProtocol>: View {
             selectedSession.session = session
             currentProfile = profile
             lastSelected = session.name
+#if os(macOS)
+            LocalCoreController.shared.storeSelectedProfileHint(session.name)
+#endif
         } catch {
             await session.close()
             throw error
@@ -940,6 +958,9 @@ struct DashboardView<Manager: NetworkExtensionManagerProtocol>: View {
         selectedSession.session = nil
         currentProfile = NetworkProfile()
         lastSelected = nil
+#if os(macOS)
+        LocalCoreController.shared.storeSelectedProfileHint(nil)
+#endif
         let defaults = UserDefaults(suiteName: APP_GROUP_ID)
         defaults?.removeObject(forKey: "VPNConfig")
         defaults?.synchronize()
