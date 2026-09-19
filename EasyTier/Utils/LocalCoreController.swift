@@ -213,7 +213,8 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
         var version: String?
         var stunInfo: NetworkStatus.STUNInfo?
         var ipList: CliIpList?
-        var listeners: [NetworkStatus.Url]?
+        // NodeInfo.listeners is a repeated string in the proto.
+        var listeners: [String]?
 
         enum CodingKeys: String, CodingKey {
             case peerId = "peer_id"
@@ -222,6 +223,10 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
             case stunInfo = "stun_info"
             case ipList = "ip_list"
             case listeners
+        }
+
+        var virtualIPv4: NetworkStatus.IPv4CIDR? {
+            LocalCoreController.parseIPv4CIDR(ipv4Addr)
         }
     }
 
@@ -286,6 +291,13 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
     ) -> NetworkStatus {
         var myNodeInfo: NetworkStatus.MyNodeInfo?
         if let node {
+            // With DHCP the config IPv4 can be empty; the route table then
+            // holds the actually assigned address.
+            var virtualIPv4 = node.virtualIPv4
+            if virtualIPv4 == nil, let peerId = node.peerId,
+               let localRoute = pairs.first(where: { $0.route.peerId == peerId }) {
+                virtualIPv4 = localRoute.route.ipv4Addr
+            }
             let ips = node.ipList.map {
                 NetworkStatus.MyNodeInfo.IPList(
                     publicIPv4: $0.publicIPv4,
@@ -295,12 +307,12 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
                 )
             }
             myNodeInfo = NetworkStatus.MyNodeInfo(
-                virtualIPv4: parseIPv4CIDR(node.ipv4Addr),
+                virtualIPv4: virtualIPv4,
                 hostname: node.hostname ?? "",
                 version: node.version ?? "",
                 ips: ips,
                 stunInfo: node.stunInfo,
-                listeners: node.listeners,
+                listeners: node.listeners?.map { NetworkStatus.Url(url: $0) },
                 vpnPortalCfg: nil,
                 peerID: node.peerId
             )
