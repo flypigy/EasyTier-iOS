@@ -256,7 +256,7 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
         }
 
         async let pairsOutput = runProcess(cli.path, ["--verbose", "peer"])
-        async let nodeOutput = runProcess(cli.path, ["node", "info"])
+        async let nodeOutput = runProcess(cli.path, ["--verbose", "node", "info"])
         let pairsJSON = try? await pairsOutput
         let nodeJSON = try? await nodeOutput
 
