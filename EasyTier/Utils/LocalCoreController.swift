@@ -1,6 +1,7 @@
 #if os(macOS)
 import CryptoKit
 import Foundation
+import EasyTierShared
 import os
 
 /// Runs the standalone EasyTier core as a root LaunchDaemon so the app can
@@ -143,7 +144,18 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
     }
 
     private func isProcessAlive() -> Bool {
-        (try? runProcess("/usr/bin/pgrep", ["-x", Self.binaryName])) != nil
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        process.arguments = ["-x", Self.binaryName]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
     }
 
     // MARK: - Log
