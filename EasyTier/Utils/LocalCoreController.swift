@@ -252,7 +252,8 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
 
         async let pairsOutput = runProcess(cli.path, ["--verbose", "peer"])
         async let nodeOutput = runProcess(cli.path, ["node", "info"])
-        let (pairsJSON, nodeJSON) = try? await (pairsOutput, nodeOutput)
+        let pairsJSON = try? await pairsOutput
+        let nodeJSON = try? await nodeOutput
 
         var pairs: [NetworkStatus.PeerRoutePair] = []
         if let pairsJSON, let data = pairsJSON.data(using: .utf8) {
