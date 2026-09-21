@@ -344,6 +344,136 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
         }
     }
 
+    // MARK: - Applied network settings
+
+    /// Approximates the applied tunnel settings the NetworkExtension path
+    /// reports by reading the live utun interface, the routing table and the
+    /// saved options.
+    func fetchNetworkSettings() async -> TunnelNetworkSettingsSnapshot? {
+        guard isCoreRunning() else { return nil }
+        let info = await fetchRunningInfo()
+        guard let virtualIPv4 = info.myNodeInfo?.virtualIPv4 else { return nil }
+        let address = virtualIPv4.address.description
+
+        guard let output = try? await runProcess("/sbin/ifconfig", []) else { return nil }
+        guard let (interface, mtu) = Self.findTunnelInterface(in: output, address: address) else {
+            return nil
+        }
+
+        var includedRoutes: [TunnelNetworkSettingsSnapshot.IPv4Subnet] = []
+        if let routesOutput = try? await runProcess("/usr/sbin/netstat", ["-rn", "-f", "inet"]) {
+            includedRoutes = Self.routes(in: routesOutput, interface: interface)
+        }
+
+        var dns: TunnelNetworkSettingsSnapshot.DNS?
+        if let data = UserDefaults(suiteName: APP_GROUP_ID)?.data(forKey: "VPNConfig"),
+           let options = try? JSONDecoder().decode(EasyTierOptions.self, from: data),
+           !options.dns.isEmpty {
+            dns = TunnelNetworkSettingsSnapshot.DNS(servers: options.dns)
+        }
+
+        let mask = Self.subnetMask(prefix: virtualIPv4.networkLength)
+        return TunnelNetworkSettingsSnapshot(
+            ipv4: .init(
+                addresses: [address],
+                subnetMasks: [mask],
+                includedRoutes: includedRoutes.isEmpty ? nil : includedRoutes
+            ),
+            dns: dns,
+            mtu: mtu
+        )
+    }
+
+    static func findTunnelInterface(
+        in output: String,
+        address: String
+    ) -> (name: String, mtu: UInt32?)? {
+        var name: String?
+        var mtu: UInt32?
+        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if !rawLine.hasPrefix(" ") && !rawLine.hasPrefix("\t") {
+                // Interface header, e.g. "utun5: flags=... mtu 1380"
+                let tokens = line.split(separator: " ").map(String.init)
+                guard let nameToken = tokens.first, nameToken.hasSuffix(":") else {
+                    name = nil
+                    mtu = nil
+                    continue
+                }
+                name = String(nameToken.dropLast())
+                mtu = tokens.firstIndex(of: "mtu").flatMap {
+                    $0 + 1 < tokens.count ? UInt32(tokens[$0 + 1]) : nil
+                }
+            } else if let name, line.hasPrefix("inet \(address) ") || line == "inet \(address)" {
+                return (name, mtu)
+            }
+        }
+        return nil
+    }
+
+    static func routes(
+        in output: String,
+        interface: String
+    ) -> [TunnelNetworkSettingsSnapshot.IPv4Subnet] {
+        var result = Set<TunnelNetworkSettingsSnapshot.IPv4Subnet>()
+        for rawLine in output.split(separator: "\n") {
+            let columns = rawLine.split(whereSeparator: { $0 == " " || $0 == "\t" })
+                .map(String.init)
+            guard columns.count >= 4, columns[3] == interface,
+                  let subnet = Self.routeDestinationSubnet(columns[0]) else {
+                continue
+            }
+            result.insert(subnet)
+        }
+        return Array(result).sorted { $0.address < $1.address }
+    }
+
+    /// Parses netstat destinations like "default", "10.144.144.10" and the
+    /// macOS-shortened "10.144.144/24" (or "192.168.31", which implies the
+    /// natural classful mask) into address + subnet mask pairs.
+    static func routeDestinationSubnet(_ destination: String) -> TunnelNetworkSettingsSnapshot.IPv4Subnet? {
+        if destination == "default" {
+            return TunnelNetworkSettingsSnapshot.IPv4Subnet(
+                address: "0.0.0.0",
+                subnetMask: Self.subnetMask(prefix: 0)
+            )
+        }
+        let parts = destination.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        var octets = parts[0].split(separator: ".").compactMap { UInt8($0) }
+        guard !octets.isEmpty, octets.count <= 4,
+              octets.count == parts[0].split(separator: ".").count else {
+            return nil
+        }
+        let prefix: Int
+        if parts.count > 1 {
+            guard let explicit = Int(parts[1]), explicit >= 0, explicit <= 32 else { return nil }
+            prefix = explicit
+        } else {
+            // netstat drops trailing ".0" and the mask for natural networks:
+            // "10" = /8, "10.144" = /16, "10.144.144" = /24, a full address = /32.
+            prefix = octets.count * 8 >= 32 ? 32 : octets.count * 8
+        }
+        while octets.count < 4 {
+            octets.append(0)
+        }
+        let address = octets.map(String.init).joined(separator: ".")
+        return TunnelNetworkSettingsSnapshot.IPv4Subnet(
+            address: address,
+            subnetMask: Self.subnetMask(prefix: prefix)
+        )
+    }
+
+    static func subnetMask(prefix: Int) -> String {
+        let value: UInt32 = prefix <= 0 ? 0 : prefix >= 32 ? .max : ~UInt32(0) << (32 - prefix)
+        let bytes = [
+            UInt8((value >> 24) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8(value & 0xff),
+        ]
+        return bytes.map(String.init).joined(separator: ".")
+    }
+
     // MARK: - Selected profile hint
 
     /// Suite defaults ("group.*") may not persist reliably for ad-hoc signed

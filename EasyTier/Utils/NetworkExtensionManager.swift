@@ -410,6 +410,12 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
     }
 
     func fetchLastNetworkSettings(_ callback: @escaping ((TunnelNetworkSettingsSnapshot?) -> Void)) {
+#if os(macOS)
+        Task {
+            let settings = await LocalCoreController.shared.fetchNetworkSettings()
+            callback(settings)
+        }
+#else
         guard let manager else {
             callback(nil)
             return
@@ -438,6 +444,7 @@ class NetworkExtensionManager: NetworkExtensionManagerProtocol {
             Self.logger.error("fetchLastNetworkSettings() failed: \(String(describing: error))")
             callback(nil)
         }
+#endif
     }
 
     func fetchWebManagementStatus(_ callback: @escaping (WebManagementStatus?) -> Void) {
