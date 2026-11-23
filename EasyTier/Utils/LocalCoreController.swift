@@ -606,6 +606,9 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
             "launchctl bootout system/\(Self.daemonLabel) >/dev/null 2>&1",
             "launchctl enable system/\(Self.daemonLabel)",
             "launchctl bootstrap system '\(Self.daemonPlistPath)'",
+            // bootstrap only loads the job; without RunAtLoad it must be
+            // kicked explicitly to start the supervisor now.
+            "launchctl kickstart system/\(Self.daemonLabel)",
         ].joined(separator: "\n")
 
         do {
