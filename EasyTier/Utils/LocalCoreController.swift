@@ -7,10 +7,12 @@ import os
 /// Runs the standalone EasyTier core as a root LaunchDaemon so the app can
 /// bring up the tunnel without NetworkExtension entitlements.
 ///
-/// The daemon (installed once via an administrator authorization prompt)
-/// supervises a watcher script that starts/stops `easytier-core` based on a
-/// config file inside an app-writable directory, so later connects and
-/// disconnects never require elevated privileges.
+/// The daemon runs on demand: it is bootstrapped (via one administrator
+/// authorization prompt) on the first connect after each boot and supervises
+/// a watcher script that starts/stops `easytier-core` based on a config file
+/// inside an app-writable directory, so later connects and disconnects never
+/// require elevated privileges. Nothing runs at boot or while the app is
+/// closed with the tunnel disconnected.
 nonisolated final class LocalCoreController: @unchecked Sendable {
     static let shared = LocalCoreController()
 
@@ -555,10 +557,15 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
                 contentsOf: URL(fileURLWithPath: "\(Self.installDir)/\(Self.watchScriptName)"),
                 encoding: .utf8
             )) == Self.renderedWatchScript()
-            if sameBinary && scriptMatches {
+            let plistMatches = (try? String(
+                contentsOf: URL(fileURLWithPath: Self.daemonPlistPath),
+                encoding: .utf8
+            )) == Self.daemonPlist
+            if sameBinary && scriptMatches && plistMatches {
                 // Files can be intact while launchd has the job unloaded or
                 // disabled (after OS updates or cleanup tools), which is only
-                // visible through the supervisor process.
+                // visible through the supervisor process. With the on-demand
+                // plist it is also simply not running yet after a reboot.
                 if isWatcherAlive() {
                     return
                 }
@@ -762,10 +769,6 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
         <string>/bin/bash</string>
         <string>/Library/Application Support/EasyTier/core-watch.sh</string>
       </array>
-      <key>RunAtLoad</key>
-      <true/>
-      <key>KeepAlive</key>
-      <true/>
       <key>ProcessType</key>
       <string>Background</string>
     </dict>

@@ -189,8 +189,7 @@ jobs:
             echo "Automated Release build for macOS (Apple Silicon, arm64) from [\`${SHORT_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})."
             echo
             echo "- Build configuration: \`${BUILD_CONFIGURATION}\`, arch: \`arm64\`"
-            echo "- Bundles the official \`easytier-core\` (${EASYTIER_VERSION}) for the local core mode: the tunnel runs as a root LaunchDaemon instead of NetworkExtension, so the VPN works without Apple Developer signing."
-            echo "- On first connect, macOS asks for the administrator password once to install the service; later connects/disconnects need no password."
+            echo "- Local core mode: the tunnel runs as a root LaunchDaemon on demand (nothing runs at boot) instead of NetworkExtension, so the VPN works without Apple Developer signing. The first connect after each boot asks once for the administrator password; later connects/disconnects need no password."
             echo "- Local core mode fetches status via a loopback-only RPC portal (127.0.0.1:15888): virtual IP, NAT type, IP lists, version and the peer list work. The event timeline and the widget status are not available in this mode."
             echo "- Remove the quarantine attribute before first launch: \`xattr -cr EasyTier.app\`"
             echo "- Uninstall the service with:"
