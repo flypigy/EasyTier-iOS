@@ -7,3 +7,4 @@ CLAUDE.md
 # Downloaded at CI build time, bundled as app resources
 EasyTier/easytier-core
 EasyTier/easytier-cli
+.DS_Store
