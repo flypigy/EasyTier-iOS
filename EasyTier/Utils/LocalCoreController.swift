@@ -329,10 +329,10 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
         )
     }
 
-    private func isProcessAlive() -> Bool {
+    private func isProcessAlive(matching pgrepArguments: [String]) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        process.arguments = ["-x", Self.binaryName]
+        process.arguments = pgrepArguments
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         do {
@@ -342,6 +342,14 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
         } catch {
             return false
         }
+    }
+
+    private func isProcessAlive() -> Bool {
+        isProcessAlive(matching: ["-x", Self.binaryName])
+    }
+
+    private func isWatcherAlive() -> Bool {
+        isProcessAlive(matching: ["-f", "\(Self.installDir)/\(Self.watchScriptName)"])
     }
 
     // MARK: - Applied network settings
@@ -548,9 +556,18 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
                 encoding: .utf8
             )) == Self.renderedWatchScript()
             if sameBinary && scriptMatches {
-                return
+                // Files can be intact while launchd has the job unloaded or
+                // disabled (after OS updates or cleanup tools), which is only
+                // visible through the supervisor process.
+                if isWatcherAlive() {
+                    return
+                }
+                Self.logger.info(
+                    "service is installed but the supervisor is not running, re-bootstrapping"
+                )
+            } else {
+                Self.logger.info("installed service is outdated (binary or paths changed), reinstalling")
             }
-            Self.logger.info("installed service is outdated (binary or paths changed), reinstalling")
         }
         try await installService(bundledBinary: bundled)
     }
@@ -580,6 +597,7 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
             "chmod 755 '\(installedBinaryURL.path)' '\(scriptPath)'",
             "chmod 644 '\(Self.daemonPlistPath)'",
             "launchctl bootout system/\(Self.daemonLabel) >/dev/null 2>&1",
+            "launchctl enable system/\(Self.daemonLabel)",
             "launchctl bootstrap system '\(Self.daemonPlistPath)'",
         ].joined(separator: "\n")
 
@@ -593,6 +611,18 @@ nonisolated final class LocalCoreController: @unchecked Sendable {
             }
             throw error
         }
+
+        // Give launchd a moment and confirm the supervisor actually came up;
+        // a disabled or failed job would otherwise surface later as an
+        // opaque connect timeout.
+        for _ in 0..<12 {
+            if isWatcherAlive() {
+                Self.logger.info("service supervisor is running")
+                return
+            }
+            try? await Task.sleep(for: .seconds(0.5))
+        }
+        Self.logger.error("service supervisor did not start after bootstrap")
     }
 
     private func runAdminScript(_ shell: String) async throws -> String {
